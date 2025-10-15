@@ -1,29 +1,45 @@
 
 
-from vllm import LLM, SamplingParams
+import requests
 
 class OverallAgent:
-    def __init__(self, model_path="meta-llama/Meta-Llama-3-8B-Instruct"):
-        self.llm = LLM(model=model_path)
-        self.sampling_params = SamplingParams(max_tokens=256)
+    def __init__(self, server_url):
+        self.server_url = server_url
+        self.max_tokens = 256
 
     def generate_response(self, prompt, character_agents):
         char_names = ', '.join([agent.name for agent in character_agents])
-        full_prompt = f"Adventure: {prompt}\nCharacters: {char_names}\nRespond with dialogue for each character."
-        outputs = self.llm.generate([full_prompt], self.sampling_params)
-        return outputs[0].outputs[0].text
+        messages = [
+            {"role": "system", "content": f"You are the narrator of a text adventure. Characters: {char_names}. Respond with dialogue for each character."},
+            {"role": "user", "content": prompt}
+        ]
+        payload = {
+            "messages": messages,
+            "max_tokens": self.max_tokens
+        }
+        response = requests.post(f"{self.server_url}/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
 
 class CharacterAgent:
-    def __init__(self, name, model_path="meta-llama/Meta-Llama-3-8B-Instruct"):
+    def __init__(self, name, server_url):
         self.name = name
-        self.llm = LLM(model=model_path)
-        self.sampling_params = SamplingParams(max_tokens=64)
+        self.server_url = server_url
+        self.max_tokens = 64
 
     def generate_dialogue(self, context):
-        prompt = f"{self.name}: {context}"
-        outputs = self.llm.generate([prompt], self.sampling_params)
-        return outputs[0].outputs[0].text
+        messages = [
+            {"role": "system", "content": f"You are {self.name}, a character in a text adventure. Respond in character."},
+            {"role": "user", "content": context}
+        ]
+        payload = {
+            "messages": messages,
+            "max_tokens": self.max_tokens
+        }
+        response = requests.post(f"{self.server_url}/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
 
 
