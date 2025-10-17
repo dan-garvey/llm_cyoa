@@ -12,9 +12,21 @@ DIRECTOR_SYSTEM_PROMPT = (
 )
 
 class TestStoryAgents(unittest.TestCase):
-    # Removed per user request
-    # Removed per user request
-    # Removed per user request
+    def wait_for_server_ready(self, log_file, timeout=60):
+        """Poll the server log file for a 'ready' message before proceeding."""
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                with open(log_file, "r") as f:
+                    lines = f.read()
+                # Look for Uvicorn or vLLM ready message
+                if "Uvicorn running on" in lines or "Server started" in lines or "Application startup complete" in lines:
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        raise RuntimeError(f"Server not ready: {log_file}")
     def setUp(self):
         self.model_path = "openai/gpt-oss-20b"
         # Assign ports and GPUs for each agent
@@ -24,18 +36,17 @@ class TestStoryAgents(unittest.TestCase):
         self.storyteller_url = f"http://127.0.0.1:{self.storyteller_port}"
         self.director_url = f"http://127.0.0.1:{self.director_port}"
         self.character_url = f"http://127.0.0.1:{self.character_port}"
-        # Start a separate server for each agent, on a different GPU
         self.storyteller_manager = VLLMServerManager(self.model_path, self.storyteller_port, gpu=0, log_file="storyteller_server.log")
         self.director_manager = VLLMServerManager(self.model_path, self.director_port, gpu=1, log_file="director_server.log")
-        self.character_manager = VLLMServerManager(self.model_path, self.character_port, gpu=2, log_file="character_server.log")
+        self.character_manager = None
         self.storyteller_manager.start()
+        self.wait_for_server_ready("storyteller_server.log")
         self.director_manager.start()
-        self.character_manager.start()
-        # Wait for all servers to be up
+        self.wait_for_server_ready("director_server.log")
+        # Wait for storyteller and director servers to be up (API check)
         for url, manager in [
             (self.storyteller_url, self.storyteller_manager),
-            (self.director_url, self.director_manager),
-            (self.character_url, self.character_manager)
+            (self.director_url, self.director_manager)
         ]:
             for _ in range(60):
                 try:
@@ -47,42 +58,19 @@ class TestStoryAgents(unittest.TestCase):
             else:
                 manager.stop()
                 raise RuntimeError(f"vLLM server not available at {url}")
-            self.model_path = "openai/gpt-oss-20b"
-            # Assign ports and GPUs for each agent
-            self.storyteller_port = 8999
-            self.director_port = 9000
-            self.character_port = 9001
-            self.storyteller_url = f"http://127.0.0.1:{self.storyteller_port}"
-            self.director_url = f"http://127.0.0.1:{self.director_port}"
-            self.character_url = f"http://127.0.0.1:{self.character_port}"
-            # Start a separate server for each agent, on a different GPU
-            self.storyteller_manager = VLLMServerManager(self.model_path, self.storyteller_port, gpu=0)
-            self.director_manager = VLLMServerManager(self.model_path, self.director_port, gpu=1)
-            self.character_manager = VLLMServerManager(self.model_path, self.character_port, gpu=2)
-            self.storyteller_manager.start()
-            self.director_manager.start()
-            self.character_manager.start()
-            # Wait for all servers to be up
-            for url, manager in [
-                (self.storyteller_url, self.storyteller_manager),
-                (self.director_url, self.director_manager),
-                (self.character_url, self.character_manager)
-            ]:
-                for _ in range(60):
-                    try:
-                        resp = requests.get(f"{url}/v1/models", timeout=2)
-                        if resp.status_code == 200:
-                            break
-                    except Exception:
-                        time.sleep(1)
-                else:
-                    manager.stop()
-                    raise RuntimeError(f"vLLM server not available at {url}")
 
     def tearDown(self):
-            self.storyteller_manager.stop()
-            self.director_manager.stop()
-            self.character_manager.stop()
+        # Ensure all servers are stopped, even if an exception occurs
+        for manager in [self.storyteller_manager, self.director_manager]:
+            try:
+                manager.stop()
+            except Exception:
+                pass
+        if self.character_manager:
+            try:
+                self.character_manager.stop()
+            except Exception:
+                pass
 
     def test_three_agent_story(self):
         # 1. Storyteller agent generates a story with one character
@@ -114,14 +102,22 @@ class TestStoryAgents(unittest.TestCase):
             {"role": "system", "content": DIRECTOR_SYSTEM_PROMPT},
             {"role": "user", "content": f"Given the following story, spawn a character agent if appropriate. Only output valid JSON in your response. Do not provide any explanation. Story: {story}"}
         ]
-        resp_dir = requests.post(
+        # Retry director agent API call up to 5 times if 500 error
+        max_retries = 5
+        for attempt in range(max_retries):
+            resp_dir = requests.post(
                 f"{self.director_url}/v1/chat/completions",
-            json={
-                "model": "openai/gpt-oss-20b",
-                "messages": director_prompt,
-                "max_tokens": 2048
-            }
-        )
+                json={
+                    "model": "openai/gpt-oss-20b",
+                    "messages": director_prompt,
+                    "max_tokens": 2048
+                }
+            )
+            if resp_dir.status_code == 200:
+                break
+            print(f"Director agent API returned {resp_dir.status_code}, retrying in 3s... (attempt {attempt+1}/{max_retries})")
+            import time
+            time.sleep(3)
         self.assertEqual(resp_dir.status_code, 200)
         print("Full director API response:", resp_dir.json())
         director_reply = resp_dir.json()["choices"][0]["message"].get("content")
@@ -132,7 +128,7 @@ class TestStoryAgents(unittest.TestCase):
         if not director_reply:
             print("Director agent returned no response, retrying...")
             resp_dir = requests.post(
-                    f"{self.director_url}/v1/chat/completions",
+                f"{self.director_url}/v1/chat/completions",
                 json={
                     "model": "openai/gpt-oss-20b",
                     "messages": director_prompt,
@@ -156,13 +152,29 @@ class TestStoryAgents(unittest.TestCase):
         character_name = character_info.get("character_name", "Unknown")
         character_system_prompt = character_info.get("character_prompt", "You are a character.")
 
-        # 3. Character agent responds to the story
+        # 3. Spawn character agent server only when needed
+        self.character_manager = VLLMServerManager(self.model_path, self.character_port, gpu=2, log_file="character_server.log")
+        self.character_manager.start()
+        self.wait_for_server_ready("character_server.log")
+        # Wait for character server API to be up
+        for _ in range(60):
+            try:
+                resp = requests.get(f"{self.character_url}/v1/models", timeout=2)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                time.sleep(1)
+        else:
+            self.character_manager.stop()
+            raise RuntimeError(f"vLLM character server not available at {self.character_url}")
+
+        # Character agent responds to the story
         character_prompt = [
             {"role": "system", "content": character_system_prompt},
             {"role": "user", "content": story}
         ]
         resp_char = requests.post(
-                f"{self.character_url}/v1/chat/completions",
+            f"{self.character_url}/v1/chat/completions",
             json={
                 "model": "openai/gpt-oss-20b",
                 "messages": character_prompt,
