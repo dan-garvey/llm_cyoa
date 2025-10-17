@@ -1,7 +1,5 @@
 import unittest
-from scripts.spawn_vllm_server import VLLMServerManager
-import requests
-import time
+from cyoa.agent_orchestrator import AgentOrchestrator
 
 
 STORYTELLER_SYSTEM_PROMPT = (
@@ -29,59 +27,22 @@ class TestStoryAgents(unittest.TestCase):
         raise RuntimeError(f"Server not ready: {log_file}")
     def setUp(self):
         self.model_path = "openai/gpt-oss-20b"
-        # Assign ports and GPUs for each agent
-        self.storyteller_port = 8999
-        self.director_port = 9000
-        self.character_port = 9001
-        self.storyteller_url = f"http://127.0.0.1:{self.storyteller_port}"
-        self.director_url = f"http://127.0.0.1:{self.director_port}"
-        self.character_url = f"http://127.0.0.1:{self.character_port}"
-        self.storyteller_manager = VLLMServerManager(self.model_path, self.storyteller_port, gpu=0, log_file="storyteller_server.log")
-        self.director_manager = VLLMServerManager(self.model_path, self.director_port, gpu=1, log_file="director_server.log")
-        self.character_manager = None
-        self.storyteller_manager.start()
-        self.wait_for_server_ready("storyteller_server.log")
-        self.director_manager.start()
-        self.wait_for_server_ready("director_server.log")
-        # Wait for storyteller and director servers to be up (API check)
-        for url, manager in [
-            (self.storyteller_url, self.storyteller_manager),
-            (self.director_url, self.director_manager)
-        ]:
-            for _ in range(60):
-                try:
-                    resp = requests.get(f"{url}/v1/models", timeout=2)
-                    if resp.status_code == 200:
-                        break
-                except Exception:
-                    time.sleep(1)
-            else:
-                manager.stop()
-                raise RuntimeError(f"vLLM server not available at {url}")
+        self.orchestrator = AgentOrchestrator(self.model_path)
+        self.orchestrator.start_storyteller_and_director()
 
     def tearDown(self):
-        # Ensure all servers are stopped, even if an exception occurs
-        for manager in [self.storyteller_manager, self.director_manager]:
-            try:
-                manager.stop()
-            except Exception:
-                pass
-        if self.character_manager:
-            try:
-                self.character_manager.stop()
-            except Exception:
-                pass
+        self.orchestrator.stop_all()
 
     def test_three_agent_story(self):
-        # 1. Storyteller agent generates a story with one character
+        # 1. Storyteller agent generates a story
         storyteller_prompt = [
             {"role": "system", "content": STORYTELLER_SYSTEM_PROMPT},
             {"role": "user", "content": "Begin the story. Make sure to introduce at least one major character in bold (using **like this**)."}
         ]
-        resp = requests.post(
-                f"{self.storyteller_url}/v1/chat/completions",
-            json={
-                "model": "openai/gpt-oss-20b",
+        resp = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.storyteller_url}/v1/chat/completions",
+            {
+                "model": self.orchestrator.model_path,
                 "messages": storyteller_prompt,
                 "max_tokens": 512
             }
@@ -89,94 +50,45 @@ class TestStoryAgents(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         story = resp.json()["choices"][0]["message"].get("content")
         print("Storyteller agent output:\n", story)
-        if not story:
-            self.fail("Storyteller agent returned no response.")
-        # Ensure at least one bolded character is present
         import re
         bolded = re.findall(r"\*\*(.+?)\*\*", story)
-        if not bolded:
-            self.fail("Storyteller did not introduce any major character in bold.")
+        self.assertTrue(bolded, "Storyteller did not introduce any major character in bold.")
 
         # 2. Director agent decides if/when to spawn a character agent
         director_prompt = [
             {"role": "system", "content": DIRECTOR_SYSTEM_PROMPT},
             {"role": "user", "content": f"Given the following story, spawn a character agent if appropriate. Only output valid JSON in your response. Do not provide any explanation. Story: {story}"}
         ]
-        # Retry director agent API call up to 5 times if 500 error
-        max_retries = 5
-        for attempt in range(max_retries):
-            resp_dir = requests.post(
-                f"{self.director_url}/v1/chat/completions",
-                json={
-                    "model": "openai/gpt-oss-20b",
-                    "messages": director_prompt,
-                    "max_tokens": 2048
-                }
-            )
-            if resp_dir.status_code == 200:
-                break
-            print(f"Director agent API returned {resp_dir.status_code}, retrying in 3s... (attempt {attempt+1}/{max_retries})")
-            import time
-            time.sleep(3)
+        resp_dir = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.director_url}/v1/chat/completions",
+            {
+                "model": self.orchestrator.model_path,
+                "messages": director_prompt,
+                "max_tokens": 2048
+            }
+        )
         self.assertEqual(resp_dir.status_code, 200)
-        print("Full director API response:", resp_dir.json())
         director_reply = resp_dir.json()["choices"][0]["message"].get("content")
         print("Director agent output:\n", director_reply)
-
-        # Fallback: retry once if response is empty
         import json
-        if not director_reply:
-            print("Director agent returned no response, retrying...")
-            resp_dir = requests.post(
-                f"{self.director_url}/v1/chat/completions",
-                json={
-                    "model": "openai/gpt-oss-20b",
-                    "messages": director_prompt,
-                    "max_tokens": 2048
-                }
-            )
-            director_reply = resp_dir.json()["choices"][0]["message"].get("content")
-            print("Director agent retry output:\n", director_reply)
-            if not director_reply:
-                self.fail("Director agent returned no response after retry.")
-        try:
-            director_data = json.loads(director_reply)
-        except Exception:
-            print("Raw director reply:", director_reply)
-            self.fail("Director agent did not return valid JSON.")
+        director_data = json.loads(director_reply)
         self.assertIsInstance(director_data, list, "Director response should be a JSON array.")
         self.assertGreater(len(director_data), 0, "Director did not spawn any character agents.")
-        # Use the first character for the next step
         character_info = director_data[0]
         self.assertTrue(character_info.get("spawn"), "Director did not spawn a character agent.")
         character_name = character_info.get("character_name", "Unknown")
         character_system_prompt = character_info.get("character_prompt", "You are a character.")
 
         # 3. Spawn character agent server only when needed
-        self.character_manager = VLLMServerManager(self.model_path, self.character_port, gpu=2, log_file="character_server.log")
-        self.character_manager.start()
-        self.wait_for_server_ready("character_server.log")
-        # Wait for character server API to be up
-        for _ in range(60):
-            try:
-                resp = requests.get(f"{self.character_url}/v1/models", timeout=2)
-                if resp.status_code == 200:
-                    break
-            except Exception:
-                time.sleep(1)
-        else:
-            self.character_manager.stop()
-            raise RuntimeError(f"vLLM character server not available at {self.character_url}")
-
-        # Character agent responds to the story
+        self.orchestrator.start_character_manager()
         character_prompt = [
             {"role": "system", "content": character_system_prompt},
             {"role": "user", "content": story}
         ]
-        resp_char = requests.post(
-            f"{self.character_url}/v1/chat/completions",
-            json={
-                "model": "openai/gpt-oss-20b",
+        resp_char = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.character_url}/v1/chat/completions",
+            {
+                "model": self.orchestrator.model_path,
                 "messages": character_prompt,
                 "max_tokens": 256
             }
