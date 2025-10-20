@@ -13,6 +13,12 @@ class VLLMServerManager:
 
     def start(self):
         import os
+        # Delete log file on server startup
+        if self.log_file and os.path.exists(self.log_file):
+            try:
+                os.remove(self.log_file)
+            except Exception:
+                pass
         cmd = [
             "vllm", "serve", self.model_path,
             "--host", self.host,
@@ -31,12 +37,8 @@ class VLLMServerManager:
         else:
             self._log_fh = None
         self.process = subprocess.Popen(cmd, preexec_fn=os.setpgrp, env=env, stdout=stdout, stderr=stderr, close_fds=True)
-        # Wait for server to start
-        for _ in range(60):
-            if self.is_running():
-                return True
-            time.sleep(1)
-        return False
+        # Do not block waiting for server to start
+        return True
 
     def is_running(self):
         try:
