@@ -10,6 +10,75 @@ DIRECTOR_SYSTEM_PROMPT = (
 )
 
 class TestStoryAgents(unittest.TestCase):
+    def test_story_with_user_character(self):
+        # Hardcoded user character info
+        user_name = "Astra Vey"
+        user_background = "A mysterious wanderer with a silver compass, seeking the lost city of mirrors."
+        # Build storyteller prompt with user info
+        storyteller_prompt = self.orchestrator.build_storyteller_prompt_with_user(user_name, user_background)
+        # Only prompt the storyteller agent ONCE, with debug logging
+        print("\n[DEBUG] Storyteller prompt:")
+        for msg in storyteller_prompt:
+            print(f"  {msg['role']}: {msg['content']}")
+        resp = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.storyteller_url}/v1/chat/completions",
+            {
+                "model": self.model_path,
+                "messages": storyteller_prompt,
+                "max_tokens": 512
+            }
+        )
+        self.assertEqual(resp.status_code, 200)
+        story = resp.json()["choices"][0]["message"].get("content")
+        print("\nStoryteller agent output:\n", story)
+        # Check that the user's character is introduced in bold
+        import re
+        bolded = re.findall(r"\*\*(.+?)\*\*", story)
+        self.assertIn(user_name, bolded, f"User character {user_name} not introduced in bold.")
+        self.assertIn(user_name, story, f"User character {user_name} not present in story.")
+        # Continue with director and character agent as in main test, with debug logging
+        director_prompt = self.orchestrator.build_director_prompt(story, user_name)
+        print("\n[DEBUG] Director prompt:")
+        for msg in director_prompt:
+            print(f"  {msg['role']}: {msg['content']}")
+        resp_dir = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.director_url}/v1/chat/completions",
+            {
+                "model": self.model_path,
+                "messages": director_prompt,
+                "max_tokens": 2048
+            }
+        )
+        self.assertEqual(resp_dir.status_code, 200)
+        director_reply = resp_dir.json()["choices"][0]["message"].get("content")
+        print("\nDirector agent output:\n", director_reply)
+        import json
+        director_data = json.loads(director_reply)
+        self.assertIsInstance(director_data, list, "Director response should be a JSON array.")
+        self.assertGreater(len(director_data), 0, "Director did not spawn any character agents.")
+        character_info = director_data[0]
+        self.assertTrue(character_info.get("spawn"), "Director did not spawn a character agent.")
+        character_name = character_info.get("character_name", "Unknown")
+        character_system_prompt = character_info.get("character_prompt", "You are a character.")
+        self.orchestrator.start_character_manager()
+        character_prompt = [
+            {"role": "system", "content": character_system_prompt},
+            {"role": "user", "content": story}
+        ]
+        print("\n[DEBUG] Character prompt:")
+        for msg in character_prompt:
+            print(f"  {msg['role']}: {msg['content']}")
+        resp_char = self.orchestrator.post_with_retries(
+            f"{self.orchestrator.character_url}/v1/chat/completions",
+            {
+                "model": self.model_path,
+                "messages": character_prompt,
+                "max_tokens": 256
+            }
+        )
+        self.assertEqual(resp_char.status_code, 200)
+        character_reply = resp_char.json()["choices"][0]["message"]["content"]
+        print(f"\nCharacter agent ({character_name}) output:\n", character_reply)
     def wait_for_server_ready(self, log_file, timeout=60):
         """Poll the server log file for a 'ready' message before proceeding."""
         import time
@@ -26,76 +95,19 @@ class TestStoryAgents(unittest.TestCase):
             time.sleep(1)
         raise RuntimeError(f"Server not ready: {log_file}")
     def setUp(self):
-        self.model_path = "openai/gpt-oss-20b"
-        self.orchestrator = AgentOrchestrator(self.model_path)
+        self.model_path = "meta-llama/Llama-3.2-3B-Instruct"
+        # Assign GPUs explicitly (change as needed for your system)
+        self.orchestrator = AgentOrchestrator(
+            self.model_path,
+            storyteller_gpu=0,
+            director_gpu=1,
+            character_gpu=2
+        )
         self.orchestrator.start_storyteller_and_director()
 
     def tearDown(self):
         self.orchestrator.stop_all()
 
-    def test_three_agent_story(self):
-        # 1. Storyteller agent generates a story
-        storyteller_prompt = [
-            {"role": "system", "content": STORYTELLER_SYSTEM_PROMPT},
-            {"role": "user", "content": "Begin the story. Make sure to introduce at least one major character in bold (using **like this**)."}
-        ]
-        resp = self.orchestrator.post_with_retries(
-            f"{self.orchestrator.storyteller_url}/v1/chat/completions",
-            {
-                "model": self.orchestrator.model_path,
-                "messages": storyteller_prompt,
-                "max_tokens": 512
-            }
-        )
-        self.assertEqual(resp.status_code, 200)
-        story = resp.json()["choices"][0]["message"].get("content")
-        print("Storyteller agent output:\n", story)
-        import re
-        bolded = re.findall(r"\*\*(.+?)\*\*", story)
-        self.assertTrue(bolded, "Storyteller did not introduce any major character in bold.")
-
-        # 2. Director agent decides if/when to spawn a character agent
-        director_prompt = [
-            {"role": "system", "content": DIRECTOR_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Given the following story, spawn a character agent if appropriate. Only output valid JSON in your response. Do not provide any explanation. Story: {story}"}
-        ]
-        resp_dir = self.orchestrator.post_with_retries(
-            f"{self.orchestrator.director_url}/v1/chat/completions",
-            {
-                "model": self.orchestrator.model_path,
-                "messages": director_prompt,
-                "max_tokens": 2048
-            }
-        )
-        self.assertEqual(resp_dir.status_code, 200)
-        director_reply = resp_dir.json()["choices"][0]["message"].get("content")
-        print("Director agent output:\n", director_reply)
-        import json
-        director_data = json.loads(director_reply)
-        self.assertIsInstance(director_data, list, "Director response should be a JSON array.")
-        self.assertGreater(len(director_data), 0, "Director did not spawn any character agents.")
-        character_info = director_data[0]
-        self.assertTrue(character_info.get("spawn"), "Director did not spawn a character agent.")
-        character_name = character_info.get("character_name", "Unknown")
-        character_system_prompt = character_info.get("character_prompt", "You are a character.")
-
-        # 3. Spawn character agent server only when needed
-        self.orchestrator.start_character_manager()
-        character_prompt = [
-            {"role": "system", "content": character_system_prompt},
-            {"role": "user", "content": story}
-        ]
-        resp_char = self.orchestrator.post_with_retries(
-            f"{self.orchestrator.character_url}/v1/chat/completions",
-            {
-                "model": self.orchestrator.model_path,
-                "messages": character_prompt,
-                "max_tokens": 256
-            }
-        )
-        self.assertEqual(resp_char.status_code, 200)
-        character_reply = resp_char.json()["choices"][0]["message"]["content"]
-        print(f"Character agent ({character_name}) output:\n", character_reply)
 
 if __name__ == "__main__":
     unittest.main()
