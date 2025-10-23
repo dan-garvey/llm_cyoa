@@ -54,12 +54,10 @@ def main():
                 logger.debug(' '.join(str(a) for a in args))
             __builtins__.print = debug_print
         try:
-            story = orchestrator.interactive_story_loop(
-                user_name,
-                user_background,
-                [],  # No user input for the intro
-                max_turns=1
-            )
+            # Build initial storyteller prompt for intro using orchestrator method
+            storyteller_prompt = orchestrator.build_storyteller_prompt_with_user(user_name, user_background)
+            director_prompt = orchestrator.build_director_prompt("", user_name)
+            story, _, _ = orchestrator.run_story_agents(storyteller_prompt, director_prompt)
         finally:
             if args.debug:
                 __builtins__.print = orig_print
@@ -78,12 +76,14 @@ def main():
                     logger.debug(' '.join(str(a) for a in args))
                 __builtins__.print = debug_print
             try:
-                story = orchestrator.interactive_story_loop(
-                    user_name,
-                    user_background,
-                    user_inputs[-1:],  # Only the latest input for this turn
-                    max_turns=1
-                )
+                # Build prompts for each user turn
+                user_input_latest = user_inputs[-1]
+                storyteller_prompt = [
+                    {"role": "system", "content": orchestrator.STORYTELLER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input_latest}
+                ]
+                director_prompt = orchestrator.build_director_prompt(user_input_latest, user_name)
+                story, _, _ = orchestrator.run_story_agents(storyteller_prompt, director_prompt)
             finally:
                 if args.debug:
                     __builtins__.print = orig_print
